@@ -8,18 +8,20 @@
 #include <linux/cdev.h>
 #include <linux/mm.h>
 #include <linux/ioctl.h>
-
+#include <linux/proc_fs.h>
+#include <linux/poll.h>
+#include <linux/wait.h>
+#include <linux/jiffies.h>
 
 MODULE_LICENSE( "GPL" );
 MODULE_AUTHOR( "Nadin" );
 
 #define MYDEV_NAME "my_module"
 
-/* Documentation/userspace-api/ioctl/ioctl-number.rst */
 #define IOC_MAGIC '\x66'
 
-#define IOCTL_VALSET _IOW(IOC_MAGIC, 0, struct ioctl_arg)
-#define IOCTL_VALGET _IOR(IOC_MAGIC, 1, struct ioctl_arg)
+#define IOCTL_VALSET     _IOW(IOC_MAGIC, 0, struct ioctl_arg)
+#define IOCTL_VALGET     _IOR(IOC_MAGIC, 1, struct ioctl_arg)
 #define IOCTL_VALGET_NUM _IOR(IOC_MAGIC, 2, int)
 #define IOCTL_VALSET_NUM _IOW(IOC_MAGIC, 3, int)
 
@@ -38,9 +40,12 @@ static struct device *my_device;
 
 static struct kobject *mymodule;
 
-static long msize = 0;
-static long addr  = 0;
+static long msize    = 0;
+static long addr     = 0;
 static int ioctl_num = 0;
+
+static char readbuf[1024];
+static size_t readbuflen;
 
 struct ioctl_arg
 {
@@ -53,13 +58,8 @@ struct test_ioctl_data
     rwlock_t lock;
 };
 
-/* Our Private Data Structure */
-//struct my_sysfs_t
-//{
-//	int	my_value;
-//	void * __iomem *reg;
-//	char message[50];
-//};
+static struct proc_dir_entry *mychardev_proc_file;
+
 
 static ssize_t msize_show( struct kobject *kobj,
                            struct kobj_attribute *attr, char *buf )
@@ -124,23 +124,25 @@ static long mychardev_ioctl( struct file *file, unsigned int cmd,
     switch (cmd)
     {
         case IOCTL_VALSET:
-            if ( copy_from_user(&data, (int __user *)arg, sizeof(data) ))
+            if ( copy_from_user( &data, (int __user *)arg, sizeof( data ) ))
             {
                 ret = -EFAULT;
                 goto done;
             }
             printk( KERN_INFO "IOCTL set val:%x .\n", data.val );
+
             write_lock( &ioctl_data->lock );
             ioctl_data->val = data.val;
             write_unlock( &ioctl_data->lock );
+
             break;
 
         case IOCTL_VALGET:
             read_lock( &ioctl_data->lock );
             val = ioctl_data->val;
             read_unlock( &ioctl_data->lock );
-            data.val = val;
 
+            data.val = val;
             if ( copy_to_user( (int __user *)arg, &data, sizeof(data) ))
             {
                 ret = -EFAULT;
@@ -163,31 +165,57 @@ static long mychardev_ioctl( struct file *file, unsigned int cmd,
         return ret;
 }
 
-static ssize_t test_ioctl_read( struct file *file, char __user *buf,
+unsigned int poll( struct file *file, struct poll_table_struct *wait )
+{
+    printk( KERN_INFO "poll\n" );
+    // Ядро снова вызывает poll если возвращается ноль
+    poll_wait( file, &waitqueue, wait );
+    if ( readbuflen && !ret0 )
+    {
+        printk( KERN_INFO "return POLLIN\n" );
+        return POLLIN;
+    }
+    else
+    {
+        printk( KERN_INFO "return 0\n" );
+        return 0;
+    }
+}
+
+static int kthread_func( void *data )
+{
+    while ( !kthread_should_stop() )
+    {
+        readbuflen = snprintf( readbuf, sizeof( readbuf ), "%llu", ( unsigned long long )jiffies );
+        usleep_range( 1000000, 1000001 );
+        printk( KERN_INFO "wake_up\n" );
+        wake_up( &waitqueue );
+    }
+    return 0;
+}
+
+static ssize_t mychardev_read( struct file *file, char __user *buf,
                                 size_t count, loff_t *f_pos)
 {
     struct test_ioctl_data *ioctl_data = file->private_data;
     unsigned char val;
-    int retval;
-    int i = 0;
+    ssize_t ret;
 
     read_lock( &ioctl_data->lock );
     val = ioctl_data->val;
     read_unlock( &ioctl_data->lock );
 
-    for ( ; i < count; i++ )
+    if ( copy_to_user( buf, readbuf, readbuflen ))
     {
-        if ( copy_to_user(&buf[i], &val, 1) )
-        {
-            retval = -EFAULT;
-            goto out;
-        }
+        ret = -EFAULT;
     }
-    retval = count;
-    out:
-        return retval;
+    else
+    {
+        ret = readbuflen;
+    }
+    readbuflen = 0;
+    return ret;
 }
-
 
 static int mychardev_open( struct inode *inode, struct file *file )
 {
@@ -221,18 +249,6 @@ static int mychardev_release( struct inode *inode, struct file *file )
     return 0;
 }
 
-/*
-static ssize_t mychardev_read( struct file *file, char __user *buf, size_t lbuf, loff_t *ppos )
-{
-    char *kbuf = file->private_data;
-    int nbytes = lbuf - copy_to_user( buf, kbuf + *ppos, lbuf );
-    *ppos += nbytes;
-    printk( KERN_INFO "Reading device %s: nbytes = %d: ppos = %d: \n", MYDEV_NAME, nbytes, (int)*ppos );
-
-    return nbytes; // Возвращает количество прочитанных байт
-}
-*/
-
 static ssize_t mychardev_write( struct file *file, const char __user *buf, size_t lbuf, loff_t *ppos )
 {
     char *kbuf = file->private_data;
@@ -245,11 +261,12 @@ static ssize_t mychardev_write( struct file *file, const char __user *buf, size_
 
 static const struct file_operations mychardev_fops = {
     .owner          = THIS_MODULE,
-    .read           = test_ioctl_read,//mychardev_read,
+    .read           = mychardev_read,
     .write          = mychardev_write,
     .open           = mychardev_open,
     .release        = mychardev_release,
     .unlocked_ioctl = mychardev_ioctl,
+    .poll           = poll
 };
 
 static int __init mymodule_init(void)
@@ -286,6 +303,23 @@ static int __init mymodule_init(void)
     {
         printk( KERN_INFO "failed to create file in /sys/kernel/mymodule\n" );
     }
+    // Создаем файл procfs
+    mychardev_proc_file = proc_create(PROC_ENTRY_FILENAME, 0644, NULL, &mychardev_fops);
+    if (mychardev_proc_file == NULL)
+    {
+        printk( KERN_INFO "Error: Could not initialize /proc/%s\n", PROC_ENTRY_FILENAME );
+        return -ENOMEM;
+    }
+    proc_set_size(mychardev_proc_file, 80);
+    proc_set_user(mychardev_proc_file, GLOBAL_ROOT_UID, GLOBAL_ROOT_GID);
+
+    // Инициализация poll
+    debugfs_file = debugfs_create_file( "lkmc_poll", S_IRUSR | S_IWUSR, NULL, NULL, &mychardev_fops );
+    init_waitqueue_head(&waitqueue);
+    kthread = kthread_create( kthread_func, NULL, "mykthread" );
+    wake_up_process( kthread );
+
+
     return error;
 }
 
@@ -299,6 +333,9 @@ static void __exit mymodule_exit( void )
     class_destroy( my_class );
 
     kobject_put( mymodule );
+
+    kthread_stop(kthread);
+    debugfs_remove(debugfs_file);
 
     printk( KERN_INFO "mymodule: Exit success\n" );
 }
